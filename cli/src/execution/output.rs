@@ -123,15 +123,15 @@ fn render_index(envelope: &crate::OutputEnvelope<crate::IndexOutput>) -> String 
             envelope.results.omitted_files
         ));
     }
-    let omissions = sorted_omissions(&envelope.results.omissions);
-    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
-    for omission in &omissions {
-        *counts.entry(&omission.reason).or_default() += 1;
+    // Totals come from the whole omission set, so a capped entry list still
+    // reports how many files each reason accounts for.
+    for reason in &envelope.results.omission_reasons {
+        output.push_str(&format!(
+            "omission reason={} count={}\n",
+            reason.reason, reason.count
+        ));
     }
-    for (reason, count) in counts {
-        output.push_str(&format!("omission reason={} count={}\n", reason, count));
-    }
-    for omission in omissions {
+    for omission in sorted_omissions(&envelope.results.omissions) {
         output.push_str(&format!(
             "omitted {} reason={} detail={}\n",
             omission.path, omission.reason, omission.detail
@@ -530,8 +530,9 @@ fn cache(value: CacheDisposition) -> &'static str {
 mod tests {
     use super::*;
     use crate::{
-        CacheOmissionOutput, IndexOutput, InventoryCompletenessOutput, InventorySummaryOutput,
-        OutputEnvelope, OutputStatus, PlanDecisionCountsOutput, ResolverTier, StatusOutput,
+        CacheOmissionOutput, CacheOmissionReasonCountOutput, IndexOutput,
+        InventoryCompletenessOutput, InventorySummaryOutput, OutputEnvelope, OutputStatus,
+        PlanDecisionCountsOutput, ResolverTier, StatusOutput,
     };
     use code2graph::SymbolId;
 
@@ -619,6 +620,16 @@ mod tests {
                 omissions: project(Freshness::Fresh, CacheCompletenessOutput::Partial).omissions,
                 omitted_files: 2,
                 omissions_truncated: false,
+                omission_reasons: vec![
+                    CacheOmissionReasonCountOutput {
+                        reason: "file-too-large".into(),
+                        count: 1,
+                    },
+                    CacheOmissionReasonCountOutput {
+                        reason: "read-error:other".into(),
+                        count: 1,
+                    },
+                ],
                 changed: 2,
                 deleted: 1,
                 ignored_omissions: 0,
@@ -630,6 +641,51 @@ mod tests {
         assert_eq!(
             render_human(&CommandOutput::Index(envelope)),
             "indexed 3 files; 2 changed, 1 deleted; partial\npublication freshness=fresh cache=cache hit\nomitted files=2\nomission reason=file-too-large count=1\nomission reason=read-error:other count=1\nomitted a.rs reason=file-too-large detail=limit=12\nomitted z.rs reason=read-error:other detail=io-error=other\n"
+        );
+    }
+
+    /// A capped entry list still names the total for every reason, and says the
+    /// list itself was capped. The totals come from the whole omission set, so an
+    /// entry cap of one does not turn a 300-file reason into a 1-file reason.
+    #[test]
+    fn index_human_output_reports_reason_totals_above_the_entry_cap() {
+        let envelope = OutputEnvelope::new(
+            OutputStatus::Partial,
+            IndexOutput {
+                candidate: "candidate".into(),
+                snapshot: "snapshot".into(),
+                tier: ResolverTier::Scope,
+                completeness: CacheCompletenessOutput::Partial,
+                inventory_file_count: 300,
+                inventory_total_bytes: 42,
+                omissions: vec![CacheOmissionOutput {
+                    path: "src/file0000.rs".into(),
+                    reason: "file-count-limit".into(),
+                    detail: "limit=1".into(),
+                }],
+                omitted_files: 300,
+                omissions_truncated: true,
+                omission_reasons: vec![CacheOmissionReasonCountOutput {
+                    reason: "file-count-limit".into(),
+                    count: 300,
+                }],
+                changed: 0,
+                deleted: 0,
+                ignored_omissions: 0,
+                attempts: 1,
+                plan_decisions: PlanDecisionCountsOutput::default(),
+            },
+        );
+
+        let rendered = render_human(&CommandOutput::Index(envelope));
+        assert!(rendered.contains("omitted files=300\n"), "{rendered}");
+        assert!(
+            rendered.contains("warning: omission entries truncated; listing 1 of 300\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("omission reason=file-count-limit count=300\n"),
+            "{rendered}"
         );
     }
 
@@ -655,6 +711,7 @@ mod tests {
                 omissions: Vec::new(),
                 omitted_files: 0,
                 omissions_truncated: false,
+                omission_reasons: Vec::new(),
                 changed: 1,
                 deleted: 0,
                 ignored_omissions: 0,

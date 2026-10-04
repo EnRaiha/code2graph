@@ -518,6 +518,14 @@ impl From<&CacheOmission> for CacheOmissionOutput {
     }
 }
 
+/// One omission-reason total for a persisted candidate, counted over the whole
+/// omission set rather than over the capped entry list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheOmissionReasonCountOutput {
+    pub reason: String,
+    pub count: usize,
+}
+
 /// Deterministically ordered, capped view of an omission list.
 ///
 /// Returns the reported entries (at most [`DEFAULT_MAX_OMISSIONS`]) and whether
@@ -531,6 +539,25 @@ pub fn capped_omissions(omissions: &[CacheOmission]) -> (Vec<CacheOmissionOutput
     let truncated = sorted.len() > DEFAULT_MAX_OMISSIONS;
     sorted.truncate(DEFAULT_MAX_OMISSIONS);
     (sorted.into_iter().map(Into::into).collect(), truncated)
+}
+
+/// Reason totals over the whole omission set, ordered by reason.
+///
+/// Capping the entry list must not cap these: a list held back at
+/// [`DEFAULT_MAX_OMISSIONS`] entries still has to say how many files each reason
+/// accounts for.
+pub fn omission_reason_counts(omissions: &[CacheOmission]) -> Vec<CacheOmissionReasonCountOutput> {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for omission in omissions {
+        *counts.entry(omission.reason.as_str()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(reason, count)| CacheOmissionReasonCountOutput {
+            reason: reason.to_owned(),
+            count,
+        })
+        .collect()
 }
 
 /// `skip_serializing_if` for the additive truncation flags: an untruncated
@@ -582,6 +609,10 @@ pub struct IndexOutput {
     /// Present only when `omissions` was capped.
     #[serde(default, skip_serializing_if = "is_false")]
     pub omissions_truncated: bool,
+    /// Totals per reason over the whole omission set, independent of `omissions`
+    /// being capped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omission_reasons: Vec<CacheOmissionReasonCountOutput>,
     pub changed: usize,
     pub deleted: usize,
     pub ignored_omissions: usize,
@@ -611,6 +642,7 @@ impl IndexOutput {
             omitted_files: snapshot.omissions.len(),
             omissions,
             omissions_truncated,
+            omission_reasons: omission_reason_counts(&snapshot.omissions),
             changed,
             deleted,
             ignored_omissions,
@@ -962,7 +994,11 @@ mod tests {
         let omissions = (0..(DEFAULT_MAX_OMISSIONS + 5))
             .map(|index| CacheOmission {
                 path: format!("src/file{index:04}.rs"),
-                reason: "file-count-limit".into(),
+                reason: if index % 5 == 0 {
+                    "read-error:other".to_owned()
+                } else {
+                    "file-count-limit".to_owned()
+                },
                 detail: "limit=10000".into(),
             })
             .collect::<Vec<_>>();
@@ -972,9 +1008,38 @@ mod tests {
         assert!(truncated);
         assert_eq!(reported[0].path, "src/file0000.rs");
 
+        // Totals count the whole set, so a capped entry list still accounts for
+        // every omitted file, per reason.
+        assert_eq!(
+            omission_reason_counts(&omissions),
+            vec![
+                CacheOmissionReasonCountOutput {
+                    reason: "file-count-limit".into(),
+                    count: 208,
+                },
+                CacheOmissionReasonCountOutput {
+                    reason: "read-error:other".into(),
+                    count: 53,
+                },
+            ]
+        );
+
         let (short, truncated) = capped_omissions(&omissions[..3]);
         assert_eq!(short.len(), 3);
         assert!(!truncated);
+        assert_eq!(
+            omission_reason_counts(&omissions[..3]),
+            vec![
+                CacheOmissionReasonCountOutput {
+                    reason: "file-count-limit".into(),
+                    count: 2,
+                },
+                CacheOmissionReasonCountOutput {
+                    reason: "read-error:other".into(),
+                    count: 1,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1028,6 +1093,10 @@ mod tests {
             }],
             omitted_files: 1,
             omissions_truncated: false,
+            omission_reasons: vec![CacheOmissionReasonCountOutput {
+                reason: "file-too-large".into(),
+                count: 1,
+            }],
             changed: 2,
             deleted: 1,
             ignored_omissions: 4,
@@ -1053,6 +1122,9 @@ mod tests {
                     "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
                 }],
                 "omitted_files": 1,
+                "omission_reasons": [{
+                    "reason": "file-too-large", "count": 1
+                }],
                 "changed": 2,
                 "deleted": 1,
                 "ignored_omissions": 4,

@@ -68,7 +68,7 @@ pub fn select_project(request: &CliRequest, cwd: &Path) -> Result<ProjectSelecti
         });
     }
 
-    select_implicit_directory(&cwd)
+    select_implicit_directory(&cwd, canonical_home().as_deref())
 }
 
 /// The implicit root is the current directory, and an agent session usually runs
@@ -80,12 +80,24 @@ fn is_forbidden_default_root(path: &Path, home: Option<&Path>) -> bool {
     path.parent().is_none() || home.is_some_and(|home| path == home)
 }
 
-fn home_directory() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+fn canonical_home() -> Option<PathBuf> {
+    let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
+    Some(canonicalize_home(home))
 }
 
-fn select_implicit_directory(cwd: &ValidatedCwd) -> Result<ProjectSelection> {
-    if is_forbidden_default_root(&cwd.canonical, home_directory().as_deref()) {
+/// Home in the representation [`ValidatedCwd::canonical`] carries, so the two are
+/// comparable. The working directory is canonicalized, while the profile path
+/// comes from the environment: it may be reached through a symlink, and on
+/// Windows it lacks the extended-length prefix `fs::canonicalize` adds, such as
+/// in `\\?\C:\Users\example`. A home that cannot be canonicalized is used as
+/// given, so a home that does not resolve disables the comparison instead of the
+/// command.
+fn canonicalize_home(home: PathBuf) -> PathBuf {
+    fs::canonicalize(&home).unwrap_or(home)
+}
+
+fn select_implicit_directory(cwd: &ValidatedCwd, home: Option<&Path>) -> Result<ProjectSelection> {
+    if is_forbidden_default_root(&cwd.canonical, home) {
         return Err(CliError::ProjectPath {
             path: cwd.canonical.clone(),
             reason: "refusing the current directory as an implicit project root \
@@ -247,9 +259,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use super::is_trusted_system_ancestor;
-    use super::{SelectionProvenance, is_forbidden_default_root, select_project};
+    use super::{
+        SelectionProvenance, ValidatedCwd, canonicalize_home, is_forbidden_default_root,
+        select_implicit_directory, select_project,
+    };
     use crate::config::GlobalOptions;
     use crate::error::CliError;
+    use crate::exit::ExitCode;
     use crate::request::{CliRequest, CommandRequest};
 
     fn request(root: Option<&Path>, path: Option<&Path>) -> CliRequest {
@@ -391,6 +407,85 @@ mod tests {
             Some(home)
         ));
         assert!(!is_forbidden_default_root(home, None));
+
+        // The same comparison in the extended-length form Windows carries: home
+        // matches only when the canonical prefix is on both sides.
+        let extended = Path::new(r"\\?\C:\Users\example");
+        assert!(is_forbidden_default_root(extended, Some(extended)));
+        assert!(!is_forbidden_default_root(
+            extended,
+            Some(Path::new(r"C:\Users\example"))
+        ));
+    }
+
+    /// The guard compares canonical paths, so the home it receives must be in the
+    /// representation `fs::canonicalize` produces, which on Windows is the
+    /// extended-length form. Both sides here come from `fs::canonicalize`, so the
+    /// canonical representation is covered on whichever platform runs the test.
+    #[test]
+    fn implicit_cwd_refuses_the_canonical_home_and_still_selects_below_it() {
+        let directory = tempdir().expect("temporary directory");
+        let home = fs::canonicalize(directory.path()).expect("canonical home");
+        let cwd = ValidatedCwd {
+            canonical: home.clone(),
+        };
+
+        let error = select_implicit_directory(&cwd, Some(&home)).expect_err("home is refused");
+        assert!(matches!(error, CliError::ProjectPath { .. }));
+        assert!(error.to_string().contains("pass --root <DIR>"));
+        assert_eq!(error.exit_code(), ExitCode::Operational);
+
+        let project = home.join("project");
+        fs::create_dir(&project).expect("project");
+        let cwd = ValidatedCwd {
+            canonical: fs::canonicalize(&project).expect("canonical project"),
+        };
+        let selection =
+            select_implicit_directory(&cwd, Some(&home)).expect("a directory below home selects");
+        assert_eq!(
+            selection.canonical_root,
+            fs::canonicalize(&project).unwrap()
+        );
+        assert_eq!(selection.provenance, SelectionProvenance::CurrentDirectory);
+    }
+
+    /// Home reaches the guard through its canonical representation, not as the
+    /// environment spells it. A home reached through a symlink names the same
+    /// directory as the canonical working directory while comparing unequal to
+    /// it, which is the same mismatch the Windows extended-length prefix causes.
+    #[test]
+    fn implicit_cwd_matches_home_through_its_canonical_representation() {
+        let directory = tempdir().expect("temporary directory");
+        let home = directory.path().join("home");
+        fs::create_dir(&home).expect("home");
+        let canonical = fs::canonicalize(&home).expect("canonical home");
+
+        // The working directory reaches the guard already canonicalized. Home
+        // reaches it as the environment spells it, which can name the same
+        // directory through a symlink or, on Windows, without the extended-length
+        // prefix `fs::canonicalize` adds.
+        #[cfg(unix)]
+        let spelled = {
+            let linked = directory.path().join("linked-home");
+            std::os::unix::fs::symlink(&home, &linked).expect("home symlink");
+            linked
+        };
+        #[cfg(not(unix))]
+        let spelled = home.clone();
+
+        let cwd = ValidatedCwd {
+            canonical: canonical.clone(),
+        };
+        let error = select_implicit_directory(&cwd, Some(&canonicalize_home(spelled.clone())))
+            .expect_err("a home naming the working directory is refused");
+        assert!(matches!(error, CliError::ProjectPath { .. }));
+        assert_eq!(error.exit_code(), ExitCode::Operational);
+
+        // A spelling that differs from the canonical one is what the comparison
+        // cannot resolve, which is why home is canonicalized before it is used.
+        if spelled != canonical {
+            assert!(!is_forbidden_default_root(&canonical, Some(&spelled)));
+        }
     }
 
     #[test]
